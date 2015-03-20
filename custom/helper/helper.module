@@ -1,0 +1,1012 @@
+<?php
+
+/**
+ * @file
+ * Drupal Module: helper
+ * Adds custom code specific to this Drupal site.
+ */
+
+
+/**
+ * Implements hook_admin_paths().
+ * Add IMCE to admin paths (to solve missing buttons bug).
+ */
+function helper_admin_paths()
+{
+  $paths = array('imce' => TRUE,);
+  return $paths;
+}
+
+/**
+ * Implements hook_block_info().
+ */
+function helper_block_info()
+{
+  $blocks = array();
+
+  // Custom Login info block
+  $blocks['login_info'] = array(
+      'info' => t('Login Info'),
+  );
+
+  return $blocks;
+}
+
+/**
+ * Implements hook_block_view().
+ */
+function helper_block_view($delta = '')
+{
+  $block = array();
+
+  switch ($delta) {
+    case 'login_info':
+      $block['subject'] = '';
+      $block['content'] = _helper_login_info_block_content();
+      break;
+  }
+
+  return $block;
+}
+
+/**
+ * Custom Login info content.
+ */
+function _helper_login_info_block_content()
+{
+  global $user, $base_url;
+
+  $output = '<div class="logininfo">';
+
+  if (!empty($user) && 0 != $user->uid) {
+    $name = $user->name;
+    $account = user_load($user->uid);
+    $profiles = profile2_load_by_user($account);
+
+    if (!empty($profiles)) {
+      foreach ($profiles as $profile) {
+        if (field_get_items('profile2', $profile, 'field_lastname')) {
+          $name = $profile->field_firstname['und'][0]['value'] . ' ' . $profile->field_lastname['und'][0]['value'];
+          break;
+        }
+      }
+    }
+    // Set login welcome message.
+    $output .= t('You are logged in as') . ' « ' . l($name, 'users/' . $user->name) . ' » (' . l(t('Log out'), 'user/logout') . ')';
+  } else {
+    $output .= l(t('Log in'), 'user/login');
+  }
+
+  $output .= '</div>';
+  return $output;
+}
+
+/**
+ * Implements hook_views_api().
+ *
+ * Alter Views queries.
+ */
+function helper_views_api()
+{
+  return array(
+      'api' => 3,
+      'path' => drupal_get_path('module', 'helper'),
+  );
+}
+
+/**
+ * Implements hook_permission().
+ *
+ */
+function helper_permission()
+{
+  return array(
+      'use media library' => array(
+          'title' => t('Use Media library'),
+          'description' => t('Import content from the Media library.'),
+      ),
+	  'act as a student' => array(
+          'title' => t('Act as a student'),
+      ),
+	  'act as a contributor' => array(
+          'title' => t('Act as a contributor'),
+      ),
+	  'act as a manager' => array(
+          'title' => t('Act as a manager'),
+      ),
+	  'act as an administator' => array(
+          'title' => t('Act as an administator'),
+      ),
+  );
+}
+
+/**
+ * Implements hook_menu_alter().
+ *
+ */
+function helper_menu_alter(&$items)
+{
+  // Disable access to user registration pages
+  $items['user/register']['access callback'] = FALSE;
+
+  // Disable access to user creation page to force managers to create user profile
+  $items['admin/people/create']['access callback'] = FALSE;
+
+  // Disable access product display creation page to force managers to use the store section
+  $items['node/add/product-display']['access callback'] = FALSE;
+
+  // Disable user revisions page (not working with user permission)
+  $items['user/%user/revisions']['access callback'] = FALSE;
+
+  // Add a My cart tab for user buying a seat
+  $items['user/%user/cart'] = array(
+    'title' => t('My cart'),
+    'page callback' => 'drupal_goto',
+    'page arguments' => array('cart'),
+    'access callback' => 'user_is_only_authenticated',
+    //'access arguments' => array(array('authenticated user')),
+    'type' => MENU_LOCAL_TASK,
+  );
+
+  $items['contributor/register']['access callback'] = 'user_access';
+  $items['contributor/register']['access arguments'] = array('administer profiles');
+
+  // Change node clone menu item to a tab instead of an action
+  if (isset($items['node/%node/clone/%clone_token'])) {
+    $items['node/%node/clone/%clone_token']['type'] = MENU_LOCAL_TASK;
+  } else {
+    $items['node/%node/clone']['type'] = MENU_LOCAL_TASK;
+  }
+}
+
+// Check if a user has the specifies roles.
+function user_has_role($roles) {
+  if (user_is_logged_in()) {
+    global $user;
+
+    if (in_array('administrator', $user->roles)) {
+      //return TRUE;
+    }
+    foreach ($roles as $role) {
+      if (in_array($role, $user->roles)) {
+        return TRUE;
+      }
+    }
+  }
+  else {
+    return FALSE;
+  }
+}
+
+// Check if a user is only authenticated, thus in a process to buy a seat.
+function user_is_only_authenticated(){
+  global $user;
+  return count($user->roles) == 1;
+}
+
+
+/**
+ * Implements hook_form_FORMID_alter().
+ * Alter product form .
+ */
+function helper_form_commerce_product_ui_product_form_alter(&$form, &$form_state, $form_id)
+{
+  // add custom validation
+  $form['#validate'][] = 'helper_product_form_validate';
+  $form['#after_build'][] = 'helper_product_afterbuild';
+
+  // Set current language as default and remove other options
+  global $language;
+  $form['field_product_language']['und']['#options'] = array($language->language => t($language->name));
+
+  // Disable or hide Group stock field (avoid changing the calculated value)
+  if (!isset($form['#entity']->nid)) {
+    $form['field_commerce_group_stock']['#access'] = FALSE;
+  } else {
+    $form['field_commerce_group_stock']['und']['0']['value']['#attributes']['disabled'] = TRUE;
+  }
+
+  // Create hidden fields to store stats for later use (validation, display)
+  $form['total_seats'] = array(
+      '#type' => 'hidden',
+      '#value' => '0',
+  );
+
+  $form['total_completed_transaction'] = array(
+      '#type' => 'hidden',
+      '#value' => '0',
+  );
+}
+
+
+/**
+ * Alter Product form.
+ */
+function helper_product_afterbuild($form, &$form_state)
+{
+  // Display stock stats in Stock description field.
+
+  // Total number of completed transaction (number of course's orders related to users with "student" role
+  $rid = ($role = user_role_load_by_name('student')) ? $role->rid : NULL;
+
+  $query = db_select('commerce_order', 'cord')
+      ->distinct();
+
+  $query->join('commerce_line_item', 'li', 'cord.order_id = li.order_id');
+  $query->join('field_data_commerce_product', 'prod', 'li.line_item_id = prod.entity_id');
+  $query->join('users', 'u', 'cord.uid = u.uid');
+  $query->join('users_roles', 'ur', 'ur.uid = u.uid');
+  $query->condition('li.line_item_label ', $form['sku']['#default_value'], '=');
+  $query->condition('ur.rid', $rid, '='); // as student
+  $query->fields('ur');
+  $total_completed_transaction = $query->countQuery()->execute()->fetchField();
+
+  // Total number of pending transaction (number of course's orders related to unauthenticated users
+  $query = db_select('commerce_order', 'cord')
+      ->distinct();
+  $query->join('commerce_line_item', 'li', 'cord.order_id = li.order_id');
+  $query->join('field_data_commerce_product', 'prod', 'li.line_item_id = prod.entity_id');
+  $query->join('users', 'u', 'cord.uid = u.uid');
+  $query->leftJoin('users_roles', 'ur', 'ur.uid = u.uid');
+  $query->condition('li.line_item_label ', $form['sku']['#default_value'], '=');
+  $query->isNull('ur.rid'); // as unauthenticated user
+  $query->fields('ur');
+  $total_pending_transaction = $query->countQuery()->execute()->fetchField();
+
+  // total number of seats
+  $total_seats = $total_completed_transaction + $form['commerce_stock']['und'][0]['value']['#default_value'];
+
+  $stock_help_text = '<p>' . t('Total number of seats') . ': ' . $total_seats . '</p>';
+  $stock_help_text .= '<p>' . t('Number of participant per thematic group') . ': ' . $total_seats / 2 . '</p>';
+  $stock_help_text .= '<p>' . t('Number of seats bought') . ': ' . $total_completed_transaction . '</p>';
+  $stock_help_text .= '<p>' . t('Number of pending payment') . ': ' . $total_pending_transaction . '</p>';
+
+  $form['commerce_stock']['und'][0]['value']['#description'] = $stock_help_text;
+
+  // Store stat in hidden field to update the Group quota and check stock on validation
+  $form['total_seats']['#value'] = $total_seats;
+  $form['total_completed_transaction']['#value'] = $total_completed_transaction;
+
+  return $form;
+}
+
+/**
+ * Product form custom validation.
+ */
+function helper_product_form_validate($form, &$form_state)
+{
+  // Since the product display language is reset by the Auto Product Display module,
+  // we store the selected language as product language to be enabled to filter the product by language.
+  $form_state['values']['language'] = $form_state['values']['field_product_language']['und'][0]['value'];
+
+  // Check if the total number of seats is an even number (available seats + bought seats)
+  $seats = $form_state['values']['commerce_stock']['und'][0]['value'] + $form['total_completed_transaction']['#value'];
+  if ($seats % 2 == 1) {
+    form_set_error('commerce_stock', t('The total number of seats is invalid. It must be an even value. Please update the stock accordingly.'));
+  }
+
+  // Set group quota
+  $form_state['values']['field_commerce_group_stock']['und'][0]['value'] = $seats / 2;
+}
+
+/**
+ * Implements hook_form_FORMID_alter().
+ * Alter user account form .
+ */
+function helper_form_user_admin_account_alter(&$form, &$form_state, $form_id)
+{
+  global $user;
+
+  //Hide administrator account (uid 1) from the users list
+  if (!in_array('administrator', $user->roles)) {
+    $keys = array(
+        'name',
+        'status',
+        'roles',
+        'member_for',
+        'last_access',
+        'operations'
+    );
+    foreach ($keys as $key) {
+      unset($form[$key][1]);
+    }
+    unset($form['accounts']['#options'][1]);
+    unset($form['accounts']['#options'][2]);
+  }
+}
+
+/**
+ * Implements hook_form_FORMID_alter().
+ * Alter user registration form at creation (user register form - profile2 not available here...).
+ */
+function helper_form_user_register_form_alter(&$form, &$form_state, $form_id)
+{
+  $form['#validate'][] = 'helper_user_register_validate';
+  $form['account']['name']['#description'] = t('The username can only contain alphanumeric lowercase characters, underscore (_), hyphen (-), period (.) or at symbol (@).');
+
+  // Alter participant registration form (user register form + profile2)
+  if (current_path() == 'admin/people/p2rp-create/participant' || current_path() == 'participant/register') {
+    // set form action to avoid error in profile2_regpath_form_alter (profile2_regpath.module)
+    // ex: .../fr/participant/register
+    $form['#action'] = request_uri();
+
+    // hide Role field (in case a student is created by a manager. The "student" role is applied
+    // when this user will buy a seat)
+    $form['account']['roles']['#access'] = FALSE;
+  } // Alter Moodle contributor registration form (user register form + profile2)
+  elseif (current_path() == 'admin/people/p2rp-create/contributor') {
+    // hide Role field (default role is set inside profile settings)
+    $form['account']['roles']['#access'] = FALSE;
+  } elseif (current_path() == 'admin/people/p2rp-create/administration') {
+    // hide some role options
+    // remove specific roles. A new user can only be a manager or an administrator
+    unset($form['account']['roles']['#options'][5]);
+    unset($form['account']['roles']['#options'][14]);
+    unset($form['account']['roles']['#options'][15]);
+    unset($form['account']['roles']['#options'][4]);
+  } // Alter default user registration form
+  elseif (current_path() == 'admin/people/create') {
+    // remove specific role options. A new user can only be a manager or an administrator
+    unset($form['account']['roles']['#options'][5]);
+    unset($form['account']['roles']['#options'][14]);
+    unset($form['account']['roles']['#options'][4]);
+  }
+}
+
+/**
+ * Implements hook_form_FORMID_alter().
+ * Alter user profile form when editing (user register form - profile2 not available here... ).
+ */
+function helper_form_user_profile_form_alter(&$form, &$form_state, $form_id)
+{
+  $form['#validate'][] = 'helper_user_register_validate';
+  $form['account']['name']['#description'] = t('The username can only contain alphanumeric lowercase characters, underscore (_), hyphen (-), period (.) or at symbol (@).');
+}
+
+/**
+ * User register form custom validation.
+ */
+function helper_user_register_validate($form, &$form_state) {
+  if (isset($form_state['values']['name'])) {
+    $name = $form_state['values']['name'];
+
+    // To be compliant with Moodle, the username can only contain alphanumeric lowercase characters, underscore (_),
+    // hyphen (-), period (.) or at symbol (@).
+    if (strlen($name) < 4 || strlen($name) > 15) {
+      form_set_error('name', t('The username is too short. It must be more than 4 characters and less than 15 characters.'));
+    }
+    if (preg_match('/[A-Z]/', $name)) {
+      form_set_error('name', t('The username contains an uppercase character. You can use only lowercase letters.'));
+    }
+    if (preg_match('/\s/', $name)) {
+      form_set_error('name', t('The username contains a space. You can replace it with an underscore.'));
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORMID_alter().
+ * Alter Profile2 Participant form.
+ */
+function helper_form_profile2_edit_participant_form_alter(&$form, &$form_state)
+{
+  $form['#validate'][] = 'helper_participant_validate';
+
+  // Various #states settings
+
+  // Diploma sector - Other
+  $form['profile_participant']['field_diploma_sector_other']['#states'] = array(
+    'visible' => array(
+      ':input[name="profile_participant[field_student_diploma_sector][und]"]' => array('value' => 'other'),
+    ),
+    'required' => array(
+      ':input[name="profile_participant[field_student_diploma_sector][und]"]' => array('value' => 'other'),
+    ),
+  );
+
+  // Diploma recent - Other
+  $form['profile_participant']['field_recent_diploma_other']['#states'] = array(
+    'visible' => array(
+      ':input[name="profile_participant[field_student_recent_diploma][und]"]' => array('value' => 'other'),
+    ),
+    'required' => array(
+      ':input[name="profile_participant[field_student_recent_diploma][und]"]' => array('value' => 'other'),
+    ),
+  );
+
+  // Prove employement
+  $form['profile_participant']['field_student_prove_employement']['#states'] = array(
+    'visible' => array(
+      ':input[name="profile_participant[field_student_work_place][und]"]' => array('value' => '1'),
+    ),
+    'required' => array(
+      ':input[name="profile_participant[field_student_work_place][und]"]' => array('value' => '1'),
+    ),
+  );
+
+  // Prove urgent participation
+  $form['profile_participant']['field_student_prove_urgent']['#states'] = array(
+    'visible' => array(
+      ':input[name="profile_participant[field_student_urgent][und]"]' => array('value' => '1'),
+    ),
+    'required' => array(
+      ':input[name="profile_participant[field_student_urgent][und]"]' => array('value' => '1'),
+    ),
+  );
+
+  // Cooperation experience
+  $form['profile_participant']['field_student_work_exp_area']['#states'] = array(
+    'visible' => array(
+      ':input[name="profile_participant[field_student_work_cooperation][und]"]' => array('value' => '1'),
+    ),
+    'required' => array(
+      ':input[name="profile_participant[field_student_work_cooperation][und]"]' => array('value' => '1'),
+    ),
+  );
+
+  // Work sector - Other
+  $form['profile_participant']['field_student_work_sector_other']['#states'] = array(
+    'visible' => array(
+      ':input[name="profile_participant[field_student_work_sector][und]"]' => array('value' => 'other'),
+    ),
+    'required' => array(
+      ':input[name="profile_participant[field_student_work_sector][und]"]' => array('value' => 'other'),
+    ),
+  );
+
+  // Work status - Other
+  $form['profile_participant']['field_student_work_status_other']['#states'] = array(
+    'visible' => array(
+      ':input[name="profile_participant[field_student_work_status][und]"]' => array('value' => 'other'),
+    ),
+    'required' => array(
+      ':input[name="profile_participant[field_student_work_status][und]"]' => array('value' => 'other'),
+    ),
+  );
+}
+
+/**
+ * Participant custom validation.
+ */
+function helper_participant_validate($form, &$form_state)
+{
+  // Validate various #states fields:
+  // Check required fields and remove values of related conditional field (avoid storing unused data)
+  $diploma_sector_choice = $form_state['values']['profile_participant']['field_student_diploma_sector']['und'][0]['value'];
+  switch($diploma_sector_choice){
+    case 'other':
+      if(empty($form_state['values']['profile_participant']['field_diploma_sector_other']['und'][0]['value'])) {
+        form_set_error("['profile_participant']['field_diploma_sector_other']", t('!name field is required.', array('!name' => $form['profile_participant']['field_diploma_sector_other']['und'][0]['value']['#title'])));
+      }
+      break;
+
+    default:
+      $form_state['complete form']['profile_participant']['field_diploma_sector_other']['und'][0]['value']['#value'] = NULL;
+      break;
+  }
+
+  $diploma_type_choice = $form_state['values']['profile_participant']['field_student_recent_diploma']['und'][0]['value'];
+  switch($diploma_type_choice){
+    case 'other':
+      if(empty($form_state['values']['profile_participant']['field_student_recent_diploma']['und'][0]['value'])) {
+        form_set_error("['profile_participant']['field_recent_diploma_other']", t('!name field is required.', array('!name' => $form['profile_participant']['field_recent_diploma_other']['und'][0]['#title'])));
+      }
+      break;
+
+    default:
+      $form_state['complete form']['profile_participant']['field_recent_diploma_other']['und'][0]['value']['#value'] = NULL;
+      break;
+  }
+
+  $work_place_choice = $form_state['values']['profile_participant']['field_student_work_place']['und'][0]['value'];
+  switch($work_place_choice){
+    case '1':
+      if( $form_state['values']['profile_participant']['field_student_prove_employement']['und'][0]['fid'] == '0') {
+        form_set_error("['profile_participant']['field_student_prove_employement']", t('!name field is required.', array('!name' => $form['profile_participant']['field_student_prove_employement']['und'][0]['#title'])));
+      }
+      break;
+
+    default:
+      $form_state['complete form']['profile_participant']['field_student_prove_employement']['und'][0]['fid']['#value'] = '0';
+      break;
+  }
+
+  $urgent_choice = $form_state['values']['profile_participant']['field_student_urgent']['und'][0]['value'];
+  switch($urgent_choice){
+    case '1':
+      if( $form_state['values']['profile_participant']['field_student_prove_urgent']['und'][0]['fid'] == '0') {
+        form_set_error("['profile_participant']['field_student_prove_urgent']", t('!name field is required.', array('!name' => $form['profile_participant']['field_student_prove_urgent']['und'][0]['#title'])));
+      }
+      break;
+
+    default:
+      $form_state['complete form']['profile_participant']['field_student_prove_urgent']['und'][0]['fid']['#value'] = '0';
+      break;
+  }
+
+  $experience = $form_state['values']['profile_participant']['field_student_work_cooperation']['und'][0]['value'];
+  switch($experience){
+    case '1':
+      if($form_state['values']['profile_participant']['field_student_work_exp_area']['und'][0]['value'] == NULL) {
+        form_set_error("['profile_participant']['field_student_work_exp_area']", t('!name field is required.', array('!name' => $form['profile_participant']['field_student_work_exp_area']['und']['#title'])));
+      }
+      break;
+
+    default:
+      for($i = 0; $i < 3; $i++)
+      {
+        $form_state['complete form']['profile_participant']['field_student_work_exp_area']['und'][$i]['#checked'] = FALSE;
+      }
+
+      break;
+  }
+
+  $work_sector_choice = $form_state['values']['profile_participant']['field_student_work_sector']['und'][0]['value'];
+  switch($work_sector_choice){
+    case 'other':
+      if(empty($form_state['values']['profile_participant']['field_student_work_sector_other']['und'][0]['value'])) {
+        form_set_error("['profile_participant']['field_student_work_sector_other']", t('!name field is required.', array('!name' => $form['profile_participant']['field_student_work_sector_other']['und'][0]['value']['#title'])));
+      }
+      break;
+
+    default:
+      $form_state['complete form']['profile_participant']['field_student_work_sector_other']['und'][0]['value']['#value'] = NULL;
+      break;
+  }
+
+  $work_status_choice = $form_state['values']['profile_participant']['field_student_work_status']['und'][0]['value'];
+  switch($work_status_choice){
+    case 'other':
+      if(empty($form_state['values']['profile_participant']['field_student_work_status_other']['und'][0]['value'])) {
+        form_set_error("['profile_participant']['field_student_work_status_other']", t('!name field is required.', array('!name' => $form['profile_participant']['field_student_work_status_other']['und'][0]['value']['#title'])));
+      }
+      break;
+
+    default:
+      $form_state['complete form']['profile_participant']['field_student_work_status_other']['und'][0]['value']['#value'] = NULL;
+      break;
+  }
+}
+
+/**
+ * Implements hook_form_FORMID_alter().
+ * Alter Profile2 Moodle Contributor form.
+ */
+function helper_form_profile2_edit_moodle_contributor_form_alter(&$form, &$form_state)
+{
+  $form['#validate'][] = 'helper_moodle_contributor_validate';
+
+  // Hide Moodle role field
+  if (!user_access('administer profiles')) {
+    $form['profile_moodle_contributor']['field_contrib_moodle_role']['#access'] = FALSE;
+  }
+
+  // Set IBAN file label
+  $form['profile_moodle_contributor']['field_contrib_bank_account_nr']['und'][0]['iban_field']['#title'] = $form['profile_moodle_contributor']['field_contrib_bank_account_nr']['und'][0]['#title'];
+
+  // Various #states settings
+
+  // Company number choice
+  $form['profile_moodle_contributor']['field_contrib_national_id_nr']['#states'] = array(
+    'visible' => array(
+      ':input[name="profile_moodle_contributor[field_contrib_company_nr_choice][und]"]' => array('value' => '0'),
+    ),
+    'required' => array(
+      ':input[name="profile_moodle_contributor[field_contrib_company_nr_choice][und]"]' => array('value' => '0'),
+    ),
+  );
+
+  $form['profile_moodle_contributor']['field_contrib_company_nr']['#states'] = array(
+    'visible' => array(
+      ':input[name="profile_moodle_contributor[field_contrib_company_nr_choice][und]"]' => array('value' => '1'),
+    ),
+    'required' => array(
+      ':input[name="profile_moodle_contributor[field_contrib_company_nr_choice][und]"]' => array('value' => '1'),
+    ),
+  );
+
+  // Invoicing address choice
+  $form['profile_moodle_contributor']['field_invoicing_address']['#states'] = array(
+    'visible' => array(
+      ':input[name="profile_moodle_contributor[field_display_invoicing_addres][und]"]' => array('checked' => FALSE),
+    ),
+    'required' => array(
+      ':input[name="profile_moodle_contributor[field_display_invoicing_addres][und]"]' => array('checked' => FALSE),
+    ),
+  );
+
+  // Invoicing address choice
+  $form['profile_moodle_contributor']['field_contrib_vat_number']['#states'] = array(
+    'required' => array(
+      ':input[name="profile_moodle_contributor[field_contrib_vat_choice][und]"]' => array('value' => '1'),
+    ),
+  );
+}
+
+/**
+ * Contributor custom validation.
+ */
+function helper_moodle_contributor_validate($form, &$form_state)
+{
+  // Validate various #states fields:
+  // Check required fields and remove values of related conditional field (avoid storing unused data)
+  $company_nr_choice = $form_state['values']['profile_moodle_contributor']['field_contrib_company_nr_choice']['und'][0]['value'];
+  switch($company_nr_choice){
+    case '0':
+      if(empty($form_state['values']['profile_moodle_contributor']['field_contrib_national_id_nr']['und'][0]['value'])) {
+        form_set_error("['profile_moodle_contributor']['field_contrib_national_id_nr']", t('!name field is required.', array('!name' => $form['profile_moodle_contributor']['field_contrib_national_id_nr']['und'][0]['value']['#title'])));
+      }
+      unset($form_state['values']['profile_moodle_contributor']['field_contrib_company_nr']['und'][0]['value']);
+      break;
+    case '1':
+      if(empty($form_state['values']['profile_moodle_contributor']['field_contrib_company_nr']['und'][0]['value'])) {
+        form_set_error("['profile_moodle_contributor']['field_contrib_company_nr']", t('!name field is required.', array('!name' => $form['profile_moodle_contributor']['field_contrib_company_nr']['und'][0]['value']['#title'])));
+      }
+      unset($form_state['values']['profile_moodle_contributor']['field_contrib_national_id_nr']['und'][0]['value']);
+      break;
+
+    default:
+      break;
+  }
+
+  $display_invoicing_address_choice = $form_state['values']['profile_moodle_contributor']['field_display_invoicing_addres']['und'][0]['value'];
+  switch($display_invoicing_address_choice){
+    case '0':
+      if(empty($form_state['values']['profile_moodle_contributor']['field_invoicing_address']['und'][0]['country'])) {
+        form_set_error("['profile_moodle_contributor']['field_invoicing_address']", t('!name field is required.', array('!name' => $form['profile_moodle_contributor']['field_invoicing_address']['und'][0]['value']['#title'])));
+      }
+      break;
+    case '1':
+      /*
+      $form_state['values']['profile_moodle_contributor']['field_invoicing_address']['und'][0]['country'] = NULL;
+      $form['profile_moodle_contributor']['field_invoicing_address']['und'][0]['country'] = NULL;
+      form_set_value($form['profile_moodle_contributor']['field_display_invoicing_addres'],NULL,$form_state);
+      */
+      break;
+  }
+
+  $vat_choice = $form_state['values']['profile_moodle_contributor']['field_contrib_vat_choice']['und'][0]['value'];
+  switch($vat_choice){
+    case '1':
+      if(empty($form_state['values']['profile_moodle_contributor']['field_contrib_vat_number']['und'][0]['value'])) {
+        form_set_error("['profile_moodle_contributor']['field_contrib_vat_number']", t('!name field is required.', array('!name' => $form['profile_moodle_contributor']['field_contrib_vat_number']['und'][0]['value']['#title'])));
+      }
+      break;
+    default:
+      break;
+  }
+}
+
+/**
+ * Implements hook_form_FORMID_alter().
+ * Alter Invoice form .
+ */
+function helper_form_invoice_node_form_alter(&$form, &$form_state, $form_id)
+{
+  // Set user related to the invoice as author to enable a manager to create an invoice
+  // for a contributor without forgetting to change the author.
+  $action_array = explode('/', $form['#action']);
+  if(isset($action_array[4]) && is_numeric($action_array[4])){
+  $user_id = $action_array[4];
+  $invoice_user = user_load($user_id);
+  $form['author']['name']['#default_value'] = $invoice_user->name;}
+}
+
+/**
+ * Implements hook_media_browser_plugins_alter().
+ */
+function helper_media_browser_plugins_alter(&$plugins)
+{
+  // Prevent specific user to use the Media library
+  if (!user_access('use media library')) {
+    unset($plugins['library']);
+  }
+}
+
+/**
+ * Implements hook_form_FORMID_alter().
+ * Alter Add to cart form.
+ */
+function helper_form_commerce_cart_add_to_cart_form_alter(&$form, &$form_state)
+{
+  global $user;
+
+  // Restrict access to checkout only to anonymous user OR authenticated user (1 role = anonymous or future student who
+  // still need to buy a seat). Other roles are not able to buy a seat.
+  if (count($user->roles) > 1) {
+    hide($form);
+
+    // Prevent a participant to buy a second cycle.
+    $orders = commerce_order_load_multiple(array(), array(
+        'uid' => $user->uid,
+        'status' => 'completed'
+    ));
+
+    if (count($orders) > 0) {
+      hide($form);
+      drupal_set_message(t('You are already enrolled to a cycle. You cannot buy another seat.'), 'warning');
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORMID_alter().
+ * Alter checkout form.
+ */
+function helper_form_commerce_checkout_form_checkout_alter(&$form, &$form_state, $form_id)
+{
+  /**
+   * Add an extra pane to checkout form to select favourite thematical groups.
+   * Get course groups and get all members for each groups to display the quota
+   * based on the course idnumber.
+   */
+  $line_id = $form_state['order']->commerce_line_items['und'][0]['line_item_id'];
+  $item = commerce_line_item_load($line_id);
+  $course_idnumber = $item->line_item_label;
+
+  $groups = helper_get_course_groups($course_idnumber);
+  $options = _format_groups_as_options($course_idnumber, $groups, TRUE);
+
+  # update default fields options
+  for ($i = 1; $i < count($options) + 1; $i++) {
+    $form['commerce_fieldgroup_pane__group_thematical_groups']['field_thematical_group_' . $i]['und']['#options'] = $options[$i];
+  }
+
+  // force translation of field group description (not working in commerce checkout)
+  $form['commerce_fieldgroup_pane__group_thematical_groups']['#description'] = t($form['commerce_fieldgroup_pane__group_thematical_groups']['#description']);
+}
+
+/**
+ * Implements hook_form_FORMID_alter().
+ * Alter customer order form.
+ */
+function helper_form_commerce_order_ui_order_form_alter(&$form, &$form_state, $form_id)
+{
+  $line_id = $form_state['commerce_order']->commerce_line_items['und'][0]['line_item_id'];
+  $item = commerce_line_item_load($line_id);
+  $course_idnumber = $item->line_item_label;
+
+  $groups = helper_get_course_groups($course_idnumber);
+  $options = _format_groups_as_options($course_idnumber, $groups);
+
+  # update default fields options + disable fields
+  for ($i = 1; $i < count($options) + 1; $i++) {
+    $form['field_thematical_group_' . $i]['und']['#options'] = $options[$i];
+    $form['field_thematical_group_' . $i]['#disabled'] = TRUE;
+  }
+
+  $form['field_thematical_group_1']['und']['#default_value'] = $form_state['commerce_order']->field_thematical_group_1['und'][0]['value'];
+  $form['field_thematical_group_2']['und']['#default_value'] = $form_state['commerce_order']->field_thematical_group_2['und'][0]['value'];
+  $form['field_thematical_group_3']['und']['#default_value'] = $form_state['commerce_order']->field_thematical_group_3['und'][0]['value'];
+  $form['field_thematical_group_4']['und']['#default_value'] = $form_state['commerce_order']->field_thematical_group_4['und'][0]['value'];
+
+  // Hide billing info
+  $form['commerce_customer_billing']['#access'] = FALSE;
+}
+
+/**
+ * Implements hook_user_insert().
+ * Insert new created user into Moodle when created by a logged user (thus not by a participant...).
+ */
+function helper_user_insert(&$edit, $account, $category)
+{
+  if (user_is_logged_in()) {
+    module_load_include('inc', 'helper', 'includes/moodle');
+	
+	// do not create a moodle user if the new account has the "student" role (WHY ?!)
+    $rid = ($role = user_role_load_by_name('student')) ? $role->rid : NULL;
+    if (!in_array($rid, array_keys($account->roles))) {
+	
+		// A new manager, administrator or contributor account is created in both Moodle instance
+		if ( user_access('act as a contributor', $account) || user_access('act as a manager', $account) || user_access('act as an administrator', $account) ){ 
+			foreach ($GLOBALS['conf']['enabled_languages'] as $lang) {
+				$host = $GLOBALS['conf']['language_domains'][$lang];
+				$dir = $GLOBALS['conf']['moodle_dir_domain'][$lang];
+				_create_moodle_user($account, $host, $dir);
+			} 
+		}
+	}
+  }
+}
+
+/**
+ * Implements hook_user_update().
+ * Update related Moodle user account if it exists.
+ */
+function helper_user_update(&$edit, $account, $category)
+{
+  module_load_include('inc', 'helper', 'includes/moodle');
+    
+		// A manager, administrator or contributor account must be updated in both Moodle instance
+		if ( user_access('act as a contributor', $account) || user_access('act as a manager', $account) || user_access('act as an administrator', $account) ){ 
+			foreach ($GLOBALS['conf']['enabled_languages'] as $lang) {
+				$host = $GLOBALS['conf']['language_domains'][$lang];
+				$dir = $GLOBALS['conf']['moodle_dir_domain'][$lang];
+				_update_moodle_user($account, $host, $dir);
+			} 
+		}
+
+
+}
+
+/**
+ * Implements hook_user_delete().
+ * Delete related Moodle user account.
+ */
+function helper_user_delete($account)
+{
+  module_load_include('inc', 'helper', 'includes/moodle');
+  
+		// A manager, administrator or contributor account must be deleted in both Moodle instance
+		if ( user_access('act as a contributor', $account) || user_access('act as a manager', $account) || user_access('act as an administrator', $account) ){ 
+			foreach ($GLOBALS['conf']['enabled_languages'] as $lang) {
+				$host = $GLOBALS['conf']['language_domains'][$lang];
+				$dir = $GLOBALS['conf']['moodle_dir_domain'][$lang];
+				_delete_moodle_user($account, $host, $dir);
+			} 
+		}
+
+}
+
+/**
+ * Implements hook_commerce_payment_order_paid_in_full().
+ * Enroll participant to a cycle and thematical groups in Moodle when the product is bought.
+ */
+function helper_commerce_payment_order_paid_in_full($transaction)
+{
+  module_load_include('inc', 'helper', 'includes/moodle');
+
+  $orderid = $transaction->order_number;
+  $order = commerce_order_load($orderid);
+  $ow = entity_metadata_wrapper('commerce_order', $order);
+
+  // load user object
+  $account = user_load($order->uid);
+
+  // Load participant profile
+  $profile = profile2_load_by_user($account, 'participant');
+
+  // Convert profile object as array
+  $converted_profile = array();
+  foreach ($profile as $key => $value) {
+    $converted_profile[$key] = $value;
+  }
+
+  // Attach the profile to the account
+  $account->profile_participant = $converted_profile;
+
+  // Insert new user into Moodle
+  _create_moodle_user($account);
+
+  foreach ($ow->commerce_line_items as $line_item) {
+    // Get Drupal product SKU. Should be also a Moodle course internal number.
+    // We should have only 1 item.
+    $sku = $line_item->commerce_product->sku->value();
+
+    // enroll participant to course
+    _enroll_participant_to_course($account, $sku);
+
+    // enroll participant to thematical groups
+    _enroll_participant_to_group($account, $order->field_thematical_group_1['und'][0]['value']);
+    _enroll_participant_to_group($account, $order->field_thematical_group_2['und'][0]['value']);
+    _enroll_participant_to_group($account, $order->field_thematical_group_3['und'][0]['value']);
+    _enroll_participant_to_group($account, $order->field_thematical_group_4['und'][0]['value']);
+  }
+}
+
+/**
+ * Returns all groups in specified course.
+ * The groups are also sorted by module.
+ *
+ * @param $course_id
+ *   A course id number.
+ * @return array
+ *   An array of course groups.
+ */
+function helper_get_course_groups($course_id)
+{
+  module_load_include('inc', 'helper', 'includes/moodle');
+  $groups = _get_course_groups($course_id);
+  return $groups;
+}
+
+/**
+ * Returns all members in specified group.
+ *
+ * @param $group_id
+ *   A group id number.
+ * @return array
+ *   An array of group members.
+ */
+function helper_get_group_members($group_id)
+{
+  module_load_include('inc', 'helper', 'includes/moodle');
+  $members = _get_group_members($group_id);
+  return $members;
+}
+
+/**
+ * Returns all groups for specified user (stored in Drupal).
+ *
+ * @param $uid
+ *   A user id.
+ * @return array
+ *   An array of groups.
+ */
+function _get_participant_groups($uid)
+{
+  $result = db_select('student_groups', 's')
+      ->fields('s', array('gid'))
+      ->condition('uid', $uid, '=')
+      ->execute();
+
+  $groups = array();
+  while ($group_id = $result->fetchAssoc()) {
+    $groups[] = $group_id['gid'];
+  }
+
+  return $groups;
+}
+
+/**
+ * Format moodle groups for a form field (options).
+ *
+ * @param $course_idnumber
+ *   A course id number.
+ * @param $groups
+ *   An array of groups.
+ * @param $show_seats
+ *   Boolean indicating whether or not to return the numbers of seats left.
+ * @return array
+ *   An array of groups.
+ */
+function _format_groups_as_options($course_idnumber, $groups, $show_seats = FALSE)
+{
+  $options = array();
+
+  if ($show_seats) {
+    $product = commerce_product_load_by_sku($course_idnumber);
+    $group_quota = $product->field_commerce_group_stock['und'][0]['value'];
+  }
+
+  foreach ($groups as $key => $group) {
+    $group_number = str_replace($course_idnumber . '_thematic_', '', $group->idnumber);
+    $group_info = explode("_", $group_number);
+
+    if ($show_seats) {
+      $quota = $group_quota;
+      $members = helper_get_group_members($group->id);
+      if (!empty($members)) {
+        $quota -= count($members[0]['userids']);
+      }
+
+      if ($quota > 0) {
+        $value = $group->name . ' (' . t('Place left') . ': ' . $quota . ')';
+      } else {
+        $value = NULL;
+      }
+    } else {
+      $value = $group->name;
+    }
+
+    if ($value != NULL) {
+      $options[$group_info[0]][$group->id] = $value;
+    }
+  }
+
+  return $options;
+}
+
+/**
+ * Implements hook_form_FORMID_alter().
+ * Alter rules action form .
+ */
+function helper_form_rules_ui_edit_element_alter(&$form, &$form_state, $form_id){
+  // Alter Ogone payment form to target local settings
+  if ($form['#action'] == '/admin/config/workflow/rules/reaction/manage/commerce_payment_ogone/edit/3') {
+    $form['parameter']['payment_method']['settings']['payment_method']['settings']['account']['#default_value'] = variable_get_value('ogone_account');
+    $form['parameter']['payment_method']['settings']['payment_method']['settings']['pspid']['#default_value'] = variable_get_value('ogone_pspid');
+    $form['parameter']['payment_method']['settings']['payment_method']['settings']['sha_in']['#default_value'] = variable_get_value('ogone_sha_in');
+    $form['parameter']['payment_method']['settings']['payment_method']['settings']['sha_out']['#default_value'] = variable_get_value('ogone_sha_out');
+  }
+}

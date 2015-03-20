@@ -1,0 +1,7 @@
+name = Helper
+description = Provides custom support functions
+version = 7.x-1.0
+core = 7.x
+package = Custom
+
+files[] = includes/moodle-client.inc

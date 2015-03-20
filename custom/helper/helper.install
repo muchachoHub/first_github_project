@@ -1,0 +1,33 @@
+<?php
+/**
+ * @file
+ * Install and uninstall functions for the Helper module.
+ */
+
+/**
+ * Implements hook_install().
+ */
+function helper_install() {
+  drupal_set_message(st("The module Helper has been installed."), 'status');
+}
+
+/**
+ * Implements hook_uninstall.
+ */
+function helper_uninstall() {
+  drupal_set_message(st("The module Helper has been uninstalled."), 'status');
+}
+
+/**
+ * Implements hook_enable.
+ */
+function helper_enable() {
+  drupal_set_message(t("The module Helper has been enabled."), 'status');
+}
+
+/**
+ * Implements hook_disable.
+ */
+function helper_disable() {
+  drupal_set_message(t("The module Helper has been disabled."), 'status');
+}
