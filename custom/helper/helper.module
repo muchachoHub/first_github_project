@@ -14,7 +14,6 @@
 function helper_admin_paths()
 {
   $paths = array('imce' => TRUE,);
-  $var = 'test';
   return $paths;
 }
 
